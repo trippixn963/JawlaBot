@@ -1,0 +1,1225 @@
+import discord
+from discord.ext import commands
+import random
+import asyncio
+import os
+from typing import List, Dict, Optional, Tuple
+
+# Discord bot setup
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+GAME_CHANNEL_NAME = "🎮┃games"
+
+# Globals
+active_games = {}  # channel_id -> TarneebGame
+
+# Card definitions
+SUITS = ["♠", "♣", "♥", "♦"]
+SUIT_NAMES = {"♠": "Spades", "♣": "Clubs", "♥": "Hearts", "♦": "Diamonds"}
+RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
+
+class AIPlayer:
+    """AI player for Tarneeb with basic strategy"""
+    
+    def __init__(self, difficulty: str = "medium"):
+        self.difficulty = difficulty
+    
+    def make_bid_decision(self, hand: List[Tuple[str, str]], current_bid: int, passes_count: int, position: int) -> int:
+        """Make a bidding decision based on hand strength"""
+        hand_strength = self._evaluate_hand_strength(hand)
+        
+        # Basic bidding strategy
+        if hand_strength >= 8:
+            # Strong hand - bid aggressively
+            min_bid = max(current_bid + 1, 5)
+            max_bid = min(7, hand_strength // 2 + 3)
+        elif hand_strength >= 5:
+            # Medium hand - bid cautiously
+            min_bid = max(current_bid + 1, 3)
+            max_bid = min(5, hand_strength // 2 + 2)
+        else:
+            # Weak hand - usually pass unless desperate
+            if passes_count >= 2 and current_bid == 0:
+                min_bid = 1
+                max_bid = 2
+            else:
+                return 0  # Pass
+        
+        if min_bid <= max_bid and min_bid <= 7:
+            return random.randint(min_bid, max_bid)
+        
+        return 0  # Pass
+    
+    def _evaluate_hand_strength(self, hand: List[Tuple[str, str]]) -> int:
+        """Evaluate hand strength for bidding (0-13 scale)"""
+        strength = 0
+        suits_count = {"♠": 0, "♣": 0, "♥": 0, "♦": 0}
+        high_cards = 0
+        
+        # Count cards per suit and high cards
+        for rank, suit in hand:
+            suits_count[suit] += 1
+            if rank in ['A', 'K', 'Q', 'J']:
+                high_cards += {'A': 4, 'K': 3, 'Q': 2, 'J': 1}[rank]
+        
+        # Add points for high cards
+        strength += high_cards
+        
+        # Add points for long suits (potential trump suits)
+        for suit, count in suits_count.items():
+            if count >= 5:
+                strength += count - 2
+            elif count >= 3:
+                strength += 1
+        
+        return min(strength, 13)
+    
+    def choose_card_to_play(self, hand: List[Tuple[str, str]], lead_suit: Optional[str], 
+                           tarneeb_suit: str, played_cards: List[Tuple[str, str]]) -> Tuple[str, str]:
+        """Choose a card to play based on game state and basic strategy"""
+        
+        # Get valid cards to play
+        valid_cards = self._get_valid_cards(hand, lead_suit)
+        
+        if not valid_cards:
+            return random.choice(hand)
+        
+        # If no lead suit, play strategically
+        if not lead_suit:
+            return self._choose_lead_card(valid_cards, tarneeb_suit)
+        
+        # If must follow suit
+        same_suit_cards = [card for card in valid_cards if card[1] == lead_suit]
+        if same_suit_cards:
+            # Try to win if possible, otherwise play low
+            if lead_suit == tarneeb_suit:
+                # Trump suit - play high
+                return max(same_suit_cards, key=lambda x: RANKS.index(x[0]))
+            else:
+                # Non-trump - try to win or play low
+                highest_played = self._get_highest_played_card(played_cards, lead_suit, tarneeb_suit)
+                winning_cards = [card for card in same_suit_cards 
+                               if self._can_beat_card(card, highest_played, tarneeb_suit)]
+                
+                if winning_cards:
+                    return min(winning_cards, key=lambda x: RANKS.index(x[0]))  # Lowest winning card
+                else:
+                    return min(same_suit_cards, key=lambda x: RANKS.index(x[0]))  # Lowest card
+        
+        # Can't follow suit - play trump or discard
+        trump_cards = [card for card in valid_cards if card[1] == tarneeb_suit]
+        if trump_cards and self._should_trump(played_cards, tarneeb_suit):
+            return min(trump_cards, key=lambda x: RANKS.index(x[0]))  # Lowest trump
+        
+        # Discard lowest non-trump
+        non_trump = [card for card in valid_cards if card[1] != tarneeb_suit]
+        if non_trump:
+            return min(non_trump, key=lambda x: RANKS.index(x[0]))
+        
+        return random.choice(valid_cards)
+    
+    def _get_valid_cards(self, hand: List[Tuple[str, str]], lead_suit: Optional[str]) -> List[Tuple[str, str]]:
+        """Get valid cards that can be played"""
+        if not lead_suit:
+            return hand
+        
+        same_suit = [card for card in hand if card[1] == lead_suit]
+        return same_suit if same_suit else hand
+    
+    def _choose_lead_card(self, cards: List[Tuple[str, str]], tarneeb_suit: str) -> Tuple[str, str]:
+        """Choose card to lead with"""
+        # Lead with high non-trump or low trump
+        non_trump_high = [card for card in cards if card[1] != tarneeb_suit and card[0] in ['A', 'K']]
+        if non_trump_high:
+            return random.choice(non_trump_high)
+        
+        trump_cards = [card for card in cards if card[1] == tarneeb_suit]
+        if trump_cards:
+            return min(trump_cards, key=lambda x: RANKS.index(x[0]))
+        
+        return random.choice(cards)
+    
+    def _get_highest_played_card(self, played_cards: List[Tuple[str, str]], lead_suit: str, tarneeb_suit: str) -> Optional[Tuple[str, str]]:
+        """Get the highest card played so far in the trick"""
+        if not played_cards:
+            return None
+        
+        # Check for trump cards first
+        trump_cards = [card for card in played_cards if card[1] == tarneeb_suit]
+        if trump_cards:
+            return max(trump_cards, key=lambda x: RANKS.index(x[0]))
+        
+        # Otherwise, highest of lead suit
+        lead_cards = [card for card in played_cards if card[1] == lead_suit]
+        if lead_cards:
+            return max(lead_cards, key=lambda x: RANKS.index(x[0]))
+        
+        return None
+    
+    def _can_beat_card(self, my_card: Tuple[str, str], other_card: Optional[Tuple[str, str]], tarneeb_suit: str) -> bool:
+        """Check if my card can beat the other card"""
+        if not other_card:
+            return True
+        
+        my_rank, my_suit = my_card
+        other_rank, other_suit = other_card
+        
+        # Trump beats non-trump
+        if my_suit == tarneeb_suit and other_suit != tarneeb_suit:
+            return True
+        if my_suit != tarneeb_suit and other_suit == tarneeb_suit:
+            return False
+        
+        # Same suit comparison
+        if my_suit == other_suit:
+            return RANKS.index(my_rank) > RANKS.index(other_rank)
+        
+        return False
+    
+    def _should_trump(self, played_cards: List[Tuple[str, str]], tarneeb_suit: str) -> bool:
+        """Decide whether to play trump when can't follow suit"""
+        # Simple strategy: trump if no trump played yet
+        trump_played = any(card[1] == tarneeb_suit for card in played_cards)
+        return not trump_played
+    
+    def choose_tarneeb_suit(self, hand: List[Tuple[str, str]]) -> str:
+        """Choose the tarneeb (trump) suit based on hand"""
+        suit_counts = {"♠": 0, "♣": 0, "♥": 0, "♦": 0}
+        suit_strength = {"♠": 0, "♣": 0, "♥": 0, "♦": 0}
+        
+        # Count cards and calculate strength per suit
+        for rank, suit in hand:
+            suit_counts[suit] += 1
+            if rank in ['A', 'K', 'Q', 'J']:
+                suit_strength[suit] += {'A': 4, 'K': 3, 'Q': 2, 'J': 1}[rank]
+        
+        # Prefer suits with more cards and higher strength
+        best_suit = max(SUITS, key=lambda s: suit_counts[s] * 2 + suit_strength[s])
+        return best_suit
+
+class Player:
+    """Represents a player in the game"""
+    
+    def __init__(self, user_id: str, name: str, is_bot: bool = False):
+        self.id = user_id
+        self.name = name
+        self.is_bot = is_bot
+        self.hand: List[Tuple[str, str]] = []
+        self.ai_player = AIPlayer() if is_bot else None
+    
+    def add_card(self, card: Tuple[str, str]):
+        """Add a card to player's hand"""
+        self.hand.append(card)
+    
+    def remove_card(self, card: Tuple[str, str]) -> bool:
+        """Remove a card from player's hand"""
+        if card in self.hand:
+            self.hand.remove(card)
+            return True
+        return False
+    
+    def has_suit(self, suit: str) -> bool:
+        """Check if player has any cards of the given suit"""
+        return any(card[1] == suit for card in self.hand)
+
+class CardUI:
+    """Handle card display and UI elements"""
+    
+    SUIT_EMOJIS = {
+        '♠': '♠️',
+        '♣': '♣️',
+        '♥': '♥️',
+        '♦': '♦️'
+    }
+    
+    @staticmethod
+    def format_card(card: Tuple[str, str]) -> str:
+        """Format a card for display"""
+        rank, suit = card
+        emoji = CardUI.SUIT_EMOJIS.get(suit, suit)
+        return f"{rank}{emoji}"
+    
+    @staticmethod
+    def format_hand(hand: List[Tuple[str, str]]) -> str:
+        """Format a hand of cards for display"""
+        if not hand:
+            return "No cards"
+        
+        # Sort by suit, then by rank
+        sorted_hand = sorted(hand, key=lambda x: (SUITS.index(x[1]), RANKS.index(x[0])))
+        return " ".join([CardUI.format_card(card) for card in sorted_hand])
+    
+    @staticmethod
+    def create_bidding_view() -> discord.ui.View:
+        """Create bidding interface with buttons"""
+        view = discord.ui.View(timeout=300)
+        
+        # Add bid buttons (1-7)
+        for bid in range(1, 8):
+            button = discord.ui.Button(
+                label=str(bid),
+                style=discord.ButtonStyle.primary,
+                custom_id=f"bid_{bid}"
+            )
+            view.add_item(button)
+        
+        # Add pass button
+        pass_button = discord.ui.Button(
+            label="Pass",
+            style=discord.ButtonStyle.secondary,
+            custom_id="pass"
+        )
+        view.add_item(pass_button)
+        
+        return view
+    
+    @staticmethod
+    def create_tarneeb_selection_view() -> discord.ui.View:
+        """Create tarneeb suit selection interface"""
+        view = discord.ui.View(timeout=300)
+        
+        for suit in SUITS:
+            button = discord.ui.Button(
+                label=SUIT_NAMES[suit],
+                style=discord.ButtonStyle.primary,
+                custom_id=f"tarneeb_{suit}",
+                emoji=CardUI.SUIT_EMOJIS[suit]
+            )
+            view.add_item(button)
+        
+        return view
+    
+    @staticmethod
+    def create_card_selection_view(hand: List[Tuple[str, str]], lead_suit: Optional[str], tarneeb_suit: str) -> discord.ui.View:
+        """Create card selection interface"""
+        view = discord.ui.View(timeout=300)
+        
+        # Filter valid cards
+        valid_cards = []
+        if lead_suit:
+            # Must follow suit if possible
+            same_suit = [card for card in hand if card[1] == lead_suit]
+            valid_cards = same_suit if same_suit else hand
+        else:
+            valid_cards = hand
+        
+        # Limit to 25 buttons (Discord's max per view)
+        display_cards = valid_cards[:25]
+        
+        for card in display_cards:
+            rank, suit = card
+            # Use simple suit emojis for buttons
+            suit_emoji = CardUI.SUIT_EMOJIS.get(suit, suit)
+            
+            # Highlight tarneeb cards
+            style = discord.ButtonStyle.danger if suit == tarneeb_suit else discord.ButtonStyle.primary
+            
+            button = discord.ui.Button(
+                label=f"{rank}{suit}",
+                style=style,
+                custom_id=f"card_{rank}_{suit}",
+                emoji=suit_emoji
+            )
+            view.add_item(button)
+        
+        return view
+    
+    @staticmethod
+    def create_show_cards_button_view(current_player_id) -> discord.ui.View:
+        """Create a button for current player to see their cards privately"""
+        view = discord.ui.View(timeout=300)
+        
+        button = discord.ui.Button(
+            label="Show My Cards",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"show_my_cards_{current_player_id}",
+            emoji="🃏"
+        )
+        view.add_item(button)
+        
+        return view
+
+class GameStateEmbed:
+    """Create embeds for game state display"""
+    
+    @staticmethod
+    def create_teams_embed(game) -> discord.Embed:
+        """Create embed showing team composition"""
+        embed = discord.Embed(
+            title="👥 Team Composition",
+            color=0x00ff00
+        )
+        
+        team1_players = [game.players[0].name, game.players[2].name]
+        team2_players = [game.players[1].name, game.players[3].name]
+        
+        embed.add_field(
+            name="🔵 Team 1",
+            value="\n".join([f"{'🤖' if game.players[0].is_bot else '👤'} {team1_players[0]}", 
+                           f"{'🤖' if game.players[2].is_bot else '👤'} {team1_players[1]}"]),
+            inline=True
+        )
+        
+        embed.add_field(
+            name="🔴 Team 2",
+            value="\n".join([f"{'🤖' if game.players[1].is_bot else '👤'} {team2_players[0]}", 
+                           f"{'🤖' if game.players[3].is_bot else '👤'} {team2_players[1]}"]),
+            inline=True
+        )
+        
+        return embed
+    
+    @staticmethod
+    def create_game_state_embed(game) -> discord.Embed:
+        """Create embed showing current game state"""
+        embed = discord.Embed(
+            title="🎮 Game State",
+            color=0x0099ff
+        )
+        
+        embed.add_field(name="Round", value=str(game.round_number), inline=True)
+        embed.add_field(name="State", value=game.state.title(), inline=True)
+        
+        if game.current_bid > 0:
+            embed.add_field(name="Current Bid", value=f"{game.current_bid} tricks", inline=True)
+            
+        if game.highest_bidder:
+            embed.add_field(name="Highest Bidder", value=game.highest_bidder.name, inline=True)
+            
+        if game.tarneeb_suit:
+            suit_names = {'♠': 'Spades', '♥': 'Hearts', '♦': 'Diamonds', '♣': 'Clubs'}
+            embed.add_field(name="Tarneeb Suit", value=f"{game.tarneeb_suit} {suit_names[game.tarneeb_suit]}", inline=True)
+        
+        # Show current turn
+        if game.state in ["bidding", "playing"]:
+            current_player = game.players[game.current_turn_index]
+            embed.add_field(name="Current Turn", value=f"{'🤖' if current_player.is_bot else '👤'} {current_player.name}", inline=True)
+        
+        return embed
+    
+    @staticmethod
+    def create_scores_embed(game) -> discord.Embed:
+        """Create embed showing team scores"""
+        embed = discord.Embed(
+            title="🏆 Team Scores",
+            color=0xffd700
+        )
+        
+        embed.add_field(name="🔵 Team 1", value=str(game.teams_scores[0]), inline=True)
+        embed.add_field(name="🔴 Team 2", value=str(game.teams_scores[1]), inline=True)
+        embed.add_field(name="Target", value="31 points", inline=True)
+        
+        # Show individual trick counts if in playing phase
+        if game.state == "playing" and any(game.tricks_won.values()):
+            tricks_text = []
+            for i, player in enumerate(game.players):
+                team_color = "🔵" if i % 2 == 0 else "🔴"
+                bot_icon = "🤖" if player.is_bot else "👤"
+                tricks_text.append(f"{team_color} {bot_icon} {player.name}: {game.tricks_won.get(player.id, 0)}")
+            
+            embed.add_field(name="Tricks Won This Round", value="\n".join(tricks_text), inline=False)
+        
+        return embed
+    
+    @staticmethod
+    def create_playing_embed(game, current_player) -> discord.Embed:
+        """Create embed for playing phase"""
+        embed = discord.Embed(
+            title="🃏 Playing Phase",
+            description=f"**{current_player.name}**'s turn to play",
+            color=0x0099ff
+        )
+        
+        suit_names = {'♠': 'Spades', '♥': 'Hearts', '♦': 'Diamonds', '♣': 'Clubs'}
+        
+        if game.lead_suit:
+            embed.add_field(name="Lead Suit", value=f"{game.lead_suit} {suit_names[game.lead_suit]}", inline=True)
+        
+        embed.add_field(name="Tarneeb Suit", value=f"{game.tarneeb_suit} {suit_names[game.tarneeb_suit]}", inline=True)
+        
+        # Show cards played in current trick
+        if game.played_cards:
+            cards_played = []
+            for player, card in game.played_cards:
+                card_str = CardUI.format_card(card)
+                cards_played.append(f"**{player.name}**: {card_str}")
+            
+            embed.add_field(name="Cards Played", value="\n".join(cards_played), inline=False)
+        
+        if not current_player.is_bot:
+            embed.add_field(name="Instructions", value="Click 'Show My Cards' button to see your options", inline=False)
+        
+        return embed
+    
+    @staticmethod
+    def create_round_end_embed(game, result_msg: str, team_tricks: List[int]) -> discord.Embed:
+        """Create embed for round end results"""
+        embed = discord.Embed(
+            title="🏁 Round Complete",
+            description=result_msg,
+            color=0x00ff00
+        )
+        
+        embed.add_field(name="Bid", value=f"{game.current_bid} tricks by {game.highest_bidder.name}", inline=False)
+        embed.add_field(name="Team 1 Tricks", value=str(team_tricks[0]), inline=True)
+        embed.add_field(name="Team 2 Tricks", value=str(team_tricks[1]), inline=True)
+        embed.add_field(name="Total Tricks", value="13", inline=True)
+        
+        embed.add_field(name="Updated Scores", value=f"Team 1: {game.teams_scores[0]}\nTeam 2: {game.teams_scores[1]}", inline=False)
+        
+        return embed
+
+class TarneebGame:
+    """Main game logic for Tarneeb"""
+    
+    def __init__(self, channel_id: int, creator_id: str, creator_name: str):
+        self.channel_id = channel_id
+        self.players: List[Player] = [Player(creator_id, creator_name)]
+        self.state = "waiting"  # waiting, bidding, tarneeb_selection, playing, finished
+        self.round_number = 1
+        self.current_bid = 0
+        self.highest_bidder: Optional[Player] = None
+        self.bidding_turn = 0
+        self.passes_count = 0
+        self.current_turn_index = 0
+        self.tricks_won = {}
+        self.teams_scores = [0, 0]
+        self.tarneeb_suit: Optional[str] = None
+        self.played_cards = []  # List of (player, card) tuples
+        self.lead_suit: Optional[str] = None
+        self.round_number = 0
+        self.deck = []
+        self.waiting_for_card_from: Optional[str] = None
+        self.current_card_view: Optional[discord.ui.View] = None
+        self.current_ephemeral_embed: Optional[discord.Embed] = None
+    
+    def add_player(self, user_id: str, name: str) -> bool:
+        """Add a player to the game"""
+        if len(self.players) >= 4:
+            return False
+        if any(p.id == user_id for p in self.players):
+            return False
+        
+        self.players.append(Player(user_id, name))
+        return True
+    
+    def start_game(self):
+        """Start the game with current players + bots"""
+        # Fill remaining slots with bots
+        bot_names = ["🤖 Ahmad", "🤖 Sara", "🤖 Omar", "🤖 Layla"]
+        used_bot_names = []
+        
+        while len(self.players) < 4:
+            available_names = [name for name in bot_names if name not in used_bot_names]
+            if not available_names:
+                available_names = [f"🤖 Bot{len(self.players)}"]
+            
+            bot_name = random.choice(available_names)
+            used_bot_names.append(bot_name)
+            bot_id = f"bot_{len(self.players)}"
+            self.players.append(Player(bot_id, bot_name, is_bot=True))
+        
+        # Initialize game state
+        self.state = "bidding"
+        self.deal_cards()
+        self.bidding_turn = 0
+        self.current_turn_index = 0
+        
+        # Initialize tricks won tracking
+        for player in self.players:
+            self.tricks_won[player.id] = 0
+    
+    def deal_cards(self):
+        """Deal 13 cards to each player"""
+        # Create and shuffle deck
+        self.deck = [(rank, suit) for suit in SUITS for rank in RANKS]
+        random.shuffle(self.deck)
+        
+        # Deal cards
+        for i, card in enumerate(self.deck):
+            player_index = i % 4
+            self.players[player_index].add_card(card)
+    
+    def get_player(self, user_id: str) -> Optional[Player]:
+        """Get player by user ID"""
+        return next((p for p in self.players if p.id == user_id), None)
+    
+    async def handle_bid(self, interaction: discord.Interaction, bid: int, bot):
+        """Handle a bid from a player"""
+        player = self.get_player(interaction.user.id)
+        current_player = self.players[self.bidding_turn]
+        
+        if not player or player != current_player or player.is_bot:
+            await interaction.response.send_message("It's not your turn to bid!", ephemeral=True)
+            return
+        
+        if bid <= self.current_bid:
+            await interaction.response.send_message(f"Bid must be higher than {self.current_bid}!", ephemeral=True)
+            return
+        
+        self.current_bid = bid
+        self.highest_bidder = player
+        self.passes_count = 0
+        
+        await interaction.response.send_message(f"Bid of {bid} tricks accepted!", ephemeral=True)
+        await self.next_bidding_turn(interaction.channel, bot)
+    
+    async def handle_pass(self, interaction: discord.Interaction, bot):
+        """Handle a pass from a player"""
+        player = self.get_player(interaction.user.id)
+        current_player = self.players[self.bidding_turn]
+        
+        if not player or player != current_player or player.is_bot:
+            await interaction.response.send_message("It's not your turn to bid!", ephemeral=True)
+            return
+        
+        self.passes_count += 1
+        await interaction.response.send_message("Pass registered!", ephemeral=True)
+        await self.next_bidding_turn(interaction.channel, bot)
+    
+    async def next_bidding_turn(self, channel, bot):
+        """Move to next bidding turn"""
+        self.bidding_turn = (self.bidding_turn + 1) % 4
+        
+        # Check if bidding is over
+        if self.passes_count >= 3 and self.highest_bidder:
+            await self.end_bidding_phase(channel, bot)
+            return
+        elif self.passes_count >= 4:
+            # All players passed, restart round
+            await channel.send("🔄 All players passed! Starting new round...")
+            self.restart_round()
+            await self.continue_bidding(channel, bot)
+            return
+        
+        await self.continue_bidding(channel, bot)
+    
+    async def continue_bidding(self, channel, bot):
+        """Continue bidding with current player"""
+        current_player = self.players[self.bidding_turn]
+        
+        # Create bidding embed
+        embed = discord.Embed(
+            title="💰 Bidding Phase",
+            description=f"**{current_player.name}**'s turn to bid",
+            color=0xffd700
+        )
+        
+        embed.add_field(name="Current Bid", value=str(self.current_bid) if self.current_bid > 0 else "No bids yet", inline=True)
+        embed.add_field(name="Highest Bidder", value=self.highest_bidder.name if self.highest_bidder else "None", inline=True)
+        embed.add_field(name="Round", value=str(self.round_number), inline=True)
+        
+        if current_player.is_bot:
+            # Bot makes bid decision
+            await asyncio.sleep(1)  # Simulate thinking
+            bot_bid = current_player.ai_player.make_bid_decision(
+                current_player.hand, self.current_bid, self.passes_count, self.bidding_turn
+            )
+            
+            if bot_bid > 0:
+                self.current_bid = bot_bid
+                self.highest_bidder = current_player
+                self.passes_count = 0
+                embed.add_field(name="Bot Decision", value=f"Bids {bot_bid} tricks", inline=False)
+            else:
+                self.passes_count += 1
+                embed.add_field(name="Bot Decision", value="Passes", inline=False)
+            
+            await channel.send(embed=embed)
+            await self.next_bidding_turn(channel, bot)
+        else:
+            # Human player's turn
+            view = CardUI.create_bidding_view()
+            await channel.send(embed=embed, view=view)
+    
+    async def end_bidding_phase(self, channel, bot):
+        """End bidding and start tarneeb selection"""
+        embed = discord.Embed(
+            title="✅ Bidding Complete",
+            description=f"**{self.highest_bidder.name}** won with {self.current_bid} tricks",
+            color=0x00ff00
+        )
+        
+        await channel.send(embed=embed)
+        await self.start_tarneeb_selection(channel, bot)
+    
+    async def start_tarneeb_selection(self, channel, bot):
+        """Start tarneeb suit selection phase"""
+        self.state = "tarneeb_selection"
+        
+        if self.highest_bidder.is_bot:
+            # Bot chooses tarneeb suit
+            await asyncio.sleep(1)
+            chosen_suit = self.highest_bidder.ai_player.choose_tarneeb_suit(self.highest_bidder.hand)
+            await self.set_tarneeb_suit(channel, bot, chosen_suit, self.highest_bidder)
+        else:
+            # Human player chooses
+            embed = discord.Embed(
+                title="🎯 Choose Tarneeb Suit",
+                description=f"**{self.highest_bidder.name}**, choose the tarneeb (trump) suit:",
+                color=0xff6600
+            )
+            
+            view = CardUI.create_tarneeb_selection_view()
+            await channel.send(embed=embed, view=view)
+    
+    async def set_tarneeb_suit(self, channel, bot, suit: str, player: Player):
+        """Set the tarneeb suit and start playing"""
+        self.tarneeb_suit = suit
+        self.state = "playing"
+        
+        # Show chosen tarneeb
+        suit_name = SUIT_NAMES[suit]
+        embed = discord.Embed(
+            title="🎯 Tarneeb Suit Chosen",
+            description=f"**{player.name}** chose **{suit} {suit_name}** as tarneeb",
+            color=0xff6600
+        )
+        
+        embed.add_field(name="Bid", value=f"{self.current_bid} tricks", inline=True)
+        embed.add_field(name="Bidding Team", value="Team 1" if self.players.index(player) % 2 == 0 else "Team 2", inline=True)
+        
+        await channel.send(embed=embed)
+        
+        # Start playing phase
+        self.current_turn_index = 0  # Start with first player
+        await self.start_playing_turn(channel, bot)
+    
+    async def start_playing_turn(self, channel, bot):
+        """Start a player's turn in the playing phase"""
+        current_player = self.players[self.current_turn_index]
+        
+        if current_player.is_bot:
+            # Bot plays automatically
+            await asyncio.sleep(1)  # Simulate thinking
+            card_choice = current_player.ai_player.choose_card_to_play(
+                current_player.hand,
+                self.lead_suit,
+                self.tarneeb_suit,
+                [card for _, card in self.played_cards]
+            )
+            await self.play_card(channel, bot, current_player, card_choice)
+        else:
+            # Human player's turn - show public game state with private card button
+            embed = GameStateEmbed.create_playing_embed(self, current_player)
+            
+            # Create a view with a button for the current player to see their cards
+            view = CardUI.create_show_cards_button_view(current_player.id)
+            await channel.send(embed=embed, view=view)
+            
+            # Store card selection data for when player clicks the button
+            self.waiting_for_card_from = current_player.id
+    
+    async def play_card(self, channel, bot, player: Player, card: Tuple[str, str]) -> bool:
+        """Play a card and handle game logic"""
+        # Validate card play
+        if card not in player.hand:
+            return False
+        
+        # Check if player must follow suit
+        if self.lead_suit and player.has_suit(self.lead_suit) and card[1] != self.lead_suit:
+            return False
+        
+        # Remove card from hand and add to played cards
+        player.remove_card(card)
+        self.played_cards.append((player, card))
+        
+        # Set lead suit if first card
+        if not self.lead_suit:
+            self.lead_suit = card[1]
+        
+        # Show card played
+        card_str = CardUI.format_card(card)
+        embed = discord.Embed(
+            title="🎴 Card Played",
+            description=f"**{player.name}** played {card_str}",
+            color=0x0099ff
+        )
+        
+        await channel.send(embed=embed)
+        
+        # Check if trick is complete (4 cards played)
+        if len(self.played_cards) == 4:
+            await self.end_trick(channel, bot)
+        else:
+            # Next player's turn
+            self.current_turn_index = (self.current_turn_index + 1) % 4
+            await self.start_playing_turn(channel, bot)
+        
+        return True
+    
+    async def end_trick(self, channel, bot):
+        """End current trick and determine winner"""
+        # Find winning card
+        winning_card = None
+        winning_player = None
+        
+        # Check for trump cards first
+        trump_cards = [(p, c) for p, c in self.played_cards if c[1] == self.tarneeb_suit]
+        if trump_cards:
+            # Highest trump wins
+            winning_player, winning_card = max(trump_cards, key=lambda x: RANKS.index(x[1][0]))
+        else:
+            # Highest card of lead suit wins
+            lead_cards = [(p, c) for p, c in self.played_cards if c[1] == self.lead_suit]
+            if lead_cards:
+                winning_player, winning_card = max(lead_cards, key=lambda x: RANKS.index(x[1][0]))
+        
+        if winning_player:
+            # Award trick to winning player
+            self.tricks_won[winning_player.id] += 1
+            
+            # Show trick result
+            card_str = CardUI.format_card(winning_card)
+            embed = discord.Embed(
+                title="🏆 Trick Winner",
+                description=f"**{winning_player.name}** wins with {card_str}",
+                color=0x00ff00
+            )
+            
+            # Show all played cards
+            cards_summary = []
+            for player, card in self.played_cards:
+                card_display = CardUI.format_card(card)
+                if player == winning_player:
+                    cards_summary.append(f"**🏆 {player.name}: {card_display}**")
+                else:
+                    cards_summary.append(f"{player.name}: {card_display}")
+            
+            embed.add_field(name="Cards Played", value="\n".join(cards_summary), inline=False)
+            await channel.send(embed=embed)
+            
+            # Reset for next trick
+            self.played_cards = []
+            self.lead_suit = None
+            self.current_turn_index = self.players.index(winning_player)
+            
+            # Check if hand is complete (13 tricks)
+            if sum(self.tricks_won.values()) >= 13:
+                await self.end_round(channel, bot)
+            else:
+                await asyncio.sleep(2)  # Brief pause
+                await self.start_playing_turn(channel, bot)
+    
+    async def end_round(self, channel, bot):
+        """End current round and calculate scores"""
+        # Calculate team tricks
+        team_tricks = [0, 0]
+        for i, player in enumerate(self.players):
+            team_index = i % 2
+            team_tricks[team_index] += self.tricks_won.get(player.id, 0)
+        
+        # Determine if bid was made
+        bidding_team = self.players.index(self.highest_bidder) % 2
+        bid_made = team_tricks[bidding_team] >= self.current_bid
+        
+        # Calculate points
+        if bid_made:
+            # Bidding team made their bid
+            points = self.current_bid
+            self.teams_scores[bidding_team] += points
+            result_msg = f"🎉 Team {bidding_team + 1} made their bid of {self.current_bid}! (+{points} points)"
+        else:
+            # Bidding team failed
+            points = self.current_bid
+            other_team = 1 - bidding_team
+            self.teams_scores[other_team] += points
+            result_msg = f"💥 Team {bidding_team + 1} failed their bid! Team {other_team + 1} gets +{points} points"
+        
+        # Show round results
+        embed = GameStateEmbed.create_round_end_embed(self, result_msg, team_tricks)
+        await channel.send(embed=embed)
+        
+        # Check for game winner (31 points)
+        if max(self.teams_scores) >= 31:
+            await self.end_game(channel, bot)
+        else:
+            # Start next round
+            await asyncio.sleep(3)
+            await self.start_next_round(channel, bot)
+    
+    async def start_next_round(self, channel, bot):
+        """Start the next round"""
+        self.round_number += 1
+        self.restart_round()
+        
+        embed = discord.Embed(
+            title=f"🔄 Round {self.round_number}",
+            description="Starting new round...",
+            color=0x0099ff
+        )
+        
+        embed.add_field(name="Current Scores", value=f"Team 1: {self.teams_scores[0]}\nTeam 2: {self.teams_scores[1]}", inline=False)
+        
+        await channel.send(embed=embed)
+        await asyncio.sleep(2)
+        await self.continue_bidding(channel, bot)
+    
+    def restart_round(self):
+        """Reset round-specific variables"""
+        self.state = "bidding"
+        self.current_bid = 0
+        self.highest_bidder = None
+        self.bidding_turn = 0
+        self.passes_count = 0
+        self.current_turn_index = 0
+        self.tarneeb_suit = None
+        self.played_cards = []
+        self.lead_suit = None
+        
+        # Clear hands and redeal
+        for player in self.players:
+            player.hand = []
+            self.tricks_won[player.id] = 0
+        
+        self.deal_cards()
+    
+    async def end_game(self, channel, bot):
+        """End the game and show final results"""
+        winning_team = 0 if self.teams_scores[0] >= 31 else 1
+        
+        embed = discord.Embed(
+            title="🎉 Game Over!",
+            description=f"**Team {winning_team + 1}** wins!",
+            color=0xffd700
+        )
+        
+        # Show final scores
+        embed.add_field(name="Final Scores", value=f"Team 1: {self.teams_scores[0]}\nTeam 2: {self.teams_scores[1]}", inline=False)
+        
+        # Show team members
+        team_members = [[], []]
+        for i, player in enumerate(self.players):
+            team_members[i % 2].append(player.name)
+        
+        embed.add_field(name="Team 1", value="\n".join(team_members[0]), inline=True)
+        embed.add_field(name="Team 2", value="\n".join(team_members[1]), inline=True)
+        
+        await channel.send(embed=embed)
+        
+        # Clean up
+        if self.channel_id in active_games:
+            del active_games[self.channel_id]
+    
+    async def handle_interaction(self, interaction: discord.Interaction, bot):
+        """Handle Discord UI interactions"""
+        if interaction.data.get("custom_id", "").startswith("bid_"):
+            bid_value = int(interaction.data["custom_id"].split("_")[1])
+            await self.handle_bid(interaction, bid_value, bot)
+        elif interaction.data.get("custom_id") == "pass":
+            await self.handle_pass(interaction, bot)
+        elif interaction.data.get("custom_id", "").startswith("tarneeb_"):
+            suit = interaction.data["custom_id"].split("_")[1]
+            player = self.get_player(interaction.user.id)
+            if player == self.highest_bidder:
+                await interaction.response.send_message("Tarneeb suit selected!", ephemeral=True)
+                await self.set_tarneeb_suit(interaction.channel, bot, suit, player)
+            else:
+                await interaction.response.send_message("Only the highest bidder can choose the tarneeb suit!", ephemeral=True)
+        elif interaction.data.get("custom_id", "").startswith("show_my_cards_"):
+            # Handle showing cards to current player
+            player_id_from_button = interaction.data["custom_id"].split("_")[-1]
+            player = self.get_player(interaction.user.id)
+            
+            if player and str(player.id) == player_id_from_button and player.id == self.waiting_for_card_from:
+                # Create ephemeral card selection embed
+                embed = discord.Embed(
+                    title="🃏 Choose Your Card",
+                    description="Select a card to play (only you can see this):",
+                    color=0x0099ff
+                )
+                
+                # Show game context
+                suit_names = {'♠': 'Spades', '♥': 'Hearts', '♦': 'Diamonds', '♣': 'Clubs'}
+                if self.lead_suit:
+                    embed.add_field(name="Must Follow", value=f"{self.lead_suit} {suit_names[self.lead_suit]}", inline=True)
+                embed.add_field(name="Trump", value=f"{self.tarneeb_suit} {suit_names[self.tarneeb_suit]}", inline=True)
+                
+                # Show cards played so far
+                if self.played_cards:
+                    cards_played = []
+                    for p, card in self.played_cards:
+                        card_str = CardUI.format_card(card)
+                        cards_played.append(f"**{p.name}**: {card_str}")
+                    embed.add_field(name="Cards Played", value="\n".join(cards_played), inline=False)
+                
+                view = CardUI.create_card_selection_view(player.hand, self.lead_suit, self.tarneeb_suit)
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+            else:
+                await interaction.response.send_message("It's not your turn!", ephemeral=True)
+        elif interaction.data.get("custom_id", "").startswith("card_"):
+            card_data = interaction.data["custom_id"].split("_")[1:]
+            rank, suit = card_data[0], card_data[1]
+            card = (rank, suit)
+            player = self.get_player(interaction.user.id)
+            if player and player == self.players[self.current_turn_index]:
+                try:
+                    await interaction.response.defer(ephemeral=True)
+                    if await self.play_card(interaction.channel, bot, player, card):
+                        await interaction.followup.send("Card played!", ephemeral=True)
+                    else:
+                        await interaction.followup.send("Invalid card play!", ephemeral=True)
+                except:
+                    # Interaction already responded to, just play the card
+                    await self.play_card(interaction.channel, bot, player, card)
+            else:
+                try:
+                    await interaction.response.send_message("It's not your turn!", ephemeral=True)
+                except:
+                    pass
+
+# Bot Events
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user}')
+    # Set bot status with copyright
+    await bot.change_presence(activity=discord.Game(name="Created by Hamoodi © 2025 All Rights Reserved"))
+
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    """Handle button interactions"""
+    if interaction.type == discord.InteractionType.component:
+        channel_id = interaction.channel.id
+        if channel_id in active_games:
+            game = active_games[channel_id]
+            await game.handle_interaction(interaction, bot)
+
+# Bot Commands
+@bot.command(name='start')
+async def start_game(ctx):
+    """Start a new Tarneeb game"""
+    channel_id = ctx.channel.id
+    
+    if channel_id in active_games:
+        await ctx.send("❌ A game is already running in this channel!")
+        return
+    
+    # Create new game
+    game = TarneebGame(channel_id, str(ctx.author.id), ctx.author.display_name)
+    active_games[channel_id] = game
+    
+    embed = discord.Embed(
+        title="🎮 Tarneeb Game Created!",
+        description=f"**{ctx.author.display_name}** started a new game!",
+        color=0x00ff00
+    )
+    
+    embed.add_field(name="Players", value=f"1/4 - {ctx.author.display_name}", inline=False)
+    embed.add_field(name="How to Join", value="Type `!join` to join the game", inline=False)
+    embed.add_field(name="How to Start", value="Game starts automatically when 4 players join, or creator uses `!start` with fewer players (bots will fill empty slots)", inline=False)
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='join')
+async def join_game(ctx):
+    """Join an existing game"""
+    channel_id = ctx.channel.id
+    
+    if channel_id not in active_games:
+        await ctx.send("❌ No game is running in this channel! Use `!start` to create one.")
+        return
+    
+    game = active_games[channel_id]
+    
+    if game.state != "waiting":
+        await ctx.send("❌ Game has already started!")
+        return
+    
+    if game.add_player(str(ctx.author.id), ctx.author.display_name):
+        player_count = len(game.players)
+        players_list = "\n".join([f"{i+1}. {p.name}" for i, p in enumerate(game.players)])
+        
+        embed = discord.Embed(
+            title="✅ Player Joined!",
+            description=f"**{ctx.author.display_name}** joined the game!",
+            color=0x00ff00
+        )
+        
+        embed.add_field(name=f"Players ({player_count}/4)", value=players_list, inline=False)
+        
+        if player_count == 4:
+            embed.add_field(name="Status", value="🎉 Game is full! Starting...", inline=False)
+            await ctx.send(embed=embed)
+            
+            # Show team composition
+            team_embed = GameStateEmbed.create_teams_embed(game)
+            await ctx.send(embed=team_embed)
+            
+            # Start the game
+            game.start_game()
+            await asyncio.sleep(2)
+            await game.continue_bidding(ctx.channel, bot)
+        else:
+            embed.add_field(name="Status", value=f"Waiting for {4-player_count} more players...", inline=False)
+            await ctx.send(embed=embed)
+    else:
+        await ctx.send("❌ You're already in this game or the game is full!")
+
+@bot.command(name='hand')
+async def show_hand(ctx):
+    """Show your current hand (DM)"""
+    channel_id = ctx.channel.id
+    
+    if channel_id not in active_games:
+        await ctx.send("❌ No game is running in this channel!")
+        return
+    
+    game = active_games[channel_id]
+    player = game.get_player(str(ctx.author.id))
+    
+    if not player:
+        await ctx.send("❌ You're not in this game!")
+        return
+    
+    if not player.hand:
+        await ctx.send("❌ You don't have any cards yet!")
+        return
+    
+    # Send hand via DM
+    try:
+        hand_str = CardUI.format_hand(player.hand)
+        embed = discord.Embed(
+            title="🃏 Your Hand",
+            description=hand_str,
+            color=0x0099ff
+        )
+        
+        if game.tarneeb_suit:
+            embed.add_field(name="Tarneeb Suit", value=f"{game.tarneeb_suit} {SUIT_NAMES[game.tarneeb_suit]}", inline=True)
+        
+        await ctx.author.send(embed=embed)
+        await ctx.send("📨 Your hand has been sent to your DMs!")
+    except discord.Forbidden:
+        await ctx.send("❌ I can't send you a DM! Please enable DMs from server members.")
+
+@bot.command(name='game_state')
+async def show_game_state(ctx):
+    """Show current game state"""
+    channel_id = ctx.channel.id
+    
+    if channel_id not in active_games:
+        await ctx.send("❌ No game is running in this channel!")
+        return
+    
+    game = active_games[channel_id]
+    embed = GameStateEmbed.create_game_state_embed(game)
+    await ctx.send(embed=embed)
+
+@bot.command(name='scores')
+async def show_scores(ctx):
+    """Show current team scores"""
+    channel_id = ctx.channel.id
+    
+    if channel_id not in active_games:
+        await ctx.send("❌ No game is running in this channel!")
+        return
+    
+    game = active_games[channel_id]
+    embed = GameStateEmbed.create_scores_embed(game)
+    await ctx.send(embed=embed)
+
+@bot.command(name='rules')
+async def show_rules(ctx):
+    """Show Tarneeb rules"""
+    embed = discord.Embed(
+        title="📋 Tarneeb Rules",
+        description="Syrian Tarneeb card game rules",
+        color=0x0099ff
+    )
+    
+    embed.add_field(
+        name="🎯 Objective",
+        value="First team to reach 31 points wins!",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="👥 Teams",
+        value="4 players in 2 teams:\n• Team 1: Players 1 & 3\n• Team 2: Players 2 & 4",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="💰 Bidding",
+        value="Players bid on how many tricks their team can win (1-7).\nHighest bidder chooses the tarneeb (trump) suit.",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🃏 Playing",
+        value="• Must follow suit if possible\n• Tarneeb (trump) cards beat all other suits\n• Highest card of led suit wins (if no trump)\n• Winner of trick leads next",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📊 Scoring",
+        value="• If bidding team makes their bid: they get points equal to bid\n• If they fail: other team gets points equal to bid\n• First team to 31 points wins!",
+        inline=False
+    )
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='stop')
+async def stop_game(ctx):
+    """Stop the current game (creator only)"""
+    channel_id = ctx.channel.id
+    
+    if channel_id not in active_games:
+        await ctx.send("❌ No game is running in this channel!")
+        return
+    
+    game = active_games[channel_id]
+    creator = game.players[0]  # First player is always the creator
+    
+    if str(ctx.author.id) != creator.id:
+        await ctx.send("❌ Only the game creator can stop the game!")
+        return
+    
+    del active_games[channel_id]
+    
+    embed = discord.Embed(
+        title="🛑 Game Stopped",
+        description=f"Game stopped by {ctx.author.display_name}",
+        color=0xff0000
+    )
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='end')
+async def end_game_command(ctx):
+    """End the current game (any player)"""
+    channel_id = ctx.channel.id
+    
+    if channel_id not in active_games:
+        await ctx.send("❌ No game is running in this channel!")
+        return
+    
+    game = active_games[channel_id]
+    player = game.get_player(str(ctx.author.id))
+    
+    if not player:
+        await ctx.send("❌ You're not in this game!")
+        return
+    
+    del active_games[channel_id]
+    
+    embed = discord.Embed(
+        title="🏁 Game Ended",
+        description=f"Game ended by {ctx.author.display_name}",
+        color=0xff6600
+    )
+    
+    if game.state in ["playing", "finished"] and any(game.teams_scores):
+        embed.add_field(name="Final Scores", value=f"Team 1: {game.teams_scores[0]}\nTeam 2: {game.teams_scores[1]}", inline=False)
+    
+    await ctx.send(embed=embed)
+
+# Run the bot
+if __name__ == "__main__":
+    token = os.getenv('DISCORD_TOKEN')
+    if not token:
+        print("Error: DISCORD_TOKEN environment variable not set!")
+    else:
+        bot.run(token)
